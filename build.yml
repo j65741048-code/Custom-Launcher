@@ -135,8 +135,18 @@ jobs:
           cat > src/main/java/com/titania/loader/ClientEvents.java <<'EOF'
           package com.titania.loader;
 
+          import net.minecraft.Util;
           import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Renderable;
+          import net.minecraft.client.gui.components.events.GuiEventListener;
+          import net.minecraft.client.gui.screens.ConnectScreen;
+          import net.minecraft.client.gui.screens.GenericMessageScreen;
+          import net.minecraft.client.gui.screens.LevelLoadingScreen;
           import net.minecraft.client.gui.screens.LoadingOverlay;
+          import net.minecraft.client.gui.screens.ProgressScreen;
+          import net.minecraft.client.gui.screens.ReceivingLevelScreen;
+          import net.minecraft.client.gui.screens.Screen;
           import net.minecraft.client.gui.screens.TitleScreen;
           import net.neoforged.api.distmarker.Dist;
           import net.neoforged.bus.api.SubscribeEvent;
@@ -149,6 +159,8 @@ jobs:
               private static boolean iconSet = false;
               private static boolean introShown = false;
               private static boolean overlaySwapped = false;
+              private static long loadingSince = -1L;
+              private static long lastLoadingRender = 0L;
 
               @SubscribeEvent
               public static void onTick(ClientTickEvent.Pre event) {
@@ -176,6 +188,34 @@ jobs:
                       } else {
                           event.setNewScreen(new TitaniaTitleScreen());
                       }
+                  }
+              }
+
+              private static boolean isLoadingScreen(Screen s) {
+                  return s instanceof ReceivingLevelScreen || s instanceof LevelLoadingScreen
+                          || s instanceof ProgressScreen || s instanceof ConnectScreen
+                          || s instanceof GenericMessageScreen;
+              }
+
+              /** In-game loading screens (joining a world, loading terrain, connecting...) show the sinking ships. */
+              @SubscribeEvent
+              public static void onRenderPost(ScreenEvent.Render.Post event) {
+                  Screen s = event.getScreen();
+                  if (!isLoadingScreen(s)) return;
+                  long now = Util.getMillis();
+                  if (now - lastLoadingRender > 1500L) loadingSince = now;
+                  lastLoadingRender = now;
+
+                  GuiGraphics g = event.getGuiGraphics();
+                  int w = g.guiWidth();
+                  int h = g.guiHeight();
+                  // start part-way through the cycle so a ship is already sinking within a moment
+                  SeaBackground.draw(g, w, h, (now - loadingSince) / 1000f + 8f);
+                  String text = s.getTitle().getString();
+                  if (text.isEmpty()) text = "Loading...";
+                  ShipScene.title(g, Minecraft.getInstance().font, w, h, text);
+                  for (GuiEventListener c : s.children()) { // keep buttons (e.g. Cancel) visible and usable
+                      if (c instanceof Renderable r) r.render(g, event.getMouseX(), event.getMouseY(), event.getPartialTick());
                   }
               }
           }
@@ -231,29 +271,19 @@ jobs:
 
           import com.mojang.blaze3d.vertex.PoseStack;
           import com.mojang.math.Axis;
-          import net.minecraft.Util;
           import net.minecraft.client.gui.Font;
           import net.minecraft.client.gui.GuiGraphics;
           import net.minecraft.network.chat.Component;
 
+          /** The Titanic scene used by the startup loading screen and the intro. */
           public final class ShipScene {
               private ShipScene() {}
 
               /** p = sinking progress from 0 (afloat) to 1 (gone). */
               public static void draw(GuiGraphics g, int w, int h, float p) {
                   p = Math.max(0f, Math.min(1f, p));
-                  g.fillGradient(0, 0, w, h, 0xFF02040F, 0xFF14284F);
-
-                  for (int i = 0; i < 70; i++) {
-                      int x = (i * 7919) % Math.max(1, w);
-                      int y = (i * 104729) % Math.max(1, (int) (h * 0.55f));
-                      int s = (i % 5 == 0) ? 3 : 2;
-                      g.fill(x, y, x + s, y + s, 0xFFFFFFFF);
-                  }
-                  int moonSize = Math.max(10, h / 14);
-                  int mx = (int) (w * 0.82f);
-                  int my = (int) (h * 0.18f);
-                  g.fill(mx, my, mx + moonSize, my + moonSize, 0xFFF4F1DE);
+                  Sprites.ensure();
+                  Sprites.drawSky(g, w, h);
 
                   int water = (int) (h * 0.62f);
                   int u = Math.max(3, h / 48);
@@ -264,45 +294,20 @@ jobs:
                   ps.pushPose();
                   ps.translate(w / 2f, water - u * 2 + sink, 0f);
                   ps.mulPose(Axis.ZP.rotationDegrees(tilt * 78f));
-                  ship(g, u);
+                  Sprites.drawShip(g, 0, u);
                   ps.popPose();
 
-                  // water drawn over the ship so it disappears beneath the surface
                   g.fill(0, water, w, h, 0xD0083A6E);
-                  long ms = Util.getMillis();
-                  for (int x = 0; x < w; x += u * 2) {
-                      int wy = water + (int) (Math.sin((x + ms / 6.0) / (u * 3.0)) * u * 0.6);
-                      g.fill(x, wy, x + u * 2, wy + u / 2 + 1, 0xFF2E7DB8);
-                  }
+                  Sprites.drawWaves(g, w, water, u, 1);
                   if (p > 0.3f) {
                       int range = Math.max(1, h / 3);
-                      for (int i = 0; i < 14; i++) {
+                      long ms = net.minecraft.Util.getMillis();
+                      for (int i = 0; i < 8; i++) {
                           int bx = w / 2 + ((i * 37) % (u * 40)) - u * 20;
                           int by = water + range - (int) ((ms / 12L + i * 41L) % range);
                           g.fill(bx, by, bx + 3, by + 3, 0xAAFFFFFF);
                       }
                   }
-              }
-
-              private static void ship(GuiGraphics g, int u) {
-                  int BLACK = 0xFF141414, RED = 0xFF9E1B1B, WHITE = 0xFFEDEDED;
-                  int BUFF = 0xFFD9A441, WIN = 0xFFFFE08A, GREY = 0xFF555555;
-                  g.fill(-20 * u, -3 * u, 20 * u, 1 * u, BLACK);      // hull
-                  g.fill(-20 * u, 1 * u, 19 * u, 2 * u, RED);         // red bottom
-                  g.fill(20 * u, -3 * u, 21 * u, 0, BLACK);           // bow steps
-                  g.fill(21 * u, -3 * u, 22 * u, -2 * u, BLACK);
-                  g.fill(-21 * u, -3 * u, -20 * u, 2 * u, BLACK);     // stern
-                  g.fill(-16 * u, -6 * u, 14 * u, -3 * u, WHITE);     // decks
-                  g.fill(-12 * u, -8 * u, 8 * u, -6 * u, WHITE);
-                  for (int x = -15; x < 13; x += 2) {
-                      g.fill(x * u, -5 * u, x * u + u, -4 * u, WIN);  // windows
-                  }
-                  for (int k = 0; k < 4; k++) {                       // four funnels
-                      int x = (-9 + k * 5) * u;
-                      g.fill(x, -13 * u, x + 3 * u, -8 * u, BUFF);
-                      g.fill(x, -13 * u, x + 3 * u, -12 * u, BLACK);
-                  }
-                  g.fill(15 * u, -11 * u, 16 * u, -3 * u, GREY);      // mast
               }
 
               public static void title(GuiGraphics g, Font font, int w, int h, String sub) {
@@ -765,13 +770,13 @@ jobs:
 
           import com.mojang.blaze3d.vertex.PoseStack;
           import com.mojang.math.Axis;
+          import java.util.Random;
           import net.minecraft.Util;
           import net.minecraft.client.gui.GuiGraphics;
 
           /**
-           * Looping 2D side-view animation: three lanes of ships, each cycling through
-           * sailing in, floating, sinking completely, and leaving bubbles and debris.
-           * Everything is drawn with flat, blocky "textured" rectangles.
+           * Looping 2D side-view animation: three lanes of randomly chosen ships (7 kinds), each cycling through
+           * sailing in, floating, sinking completely, and leaving bubbles and debris. Ships are pre-painted sprites.
            */
           public final class SeaBackground {
               private SeaBackground() {}
@@ -782,21 +787,25 @@ jobs:
               private static final float[] LANE_X = {0.27f, 0.70f, 0.46f};
               private static final float[] LANE_DIV = {70f, 52f, 40f};
               private static final int[] WATER = {0xF0081F45, 0xF00B2E5E, 0xF00F3F7A};
-              private static final int[] WAVE = {0xFF1B4A8A, 0xFF2563A3, 0xFF3A84C4};
+              private static final int SEED = new Random().nextInt(100000);
 
+              private static int hash(int a, int b) {
+                  int x = a * 0x9E3779B1 ^ b * 0x85EBCA6B ^ SEED * 0xC2B2AE35;
+                  x ^= x >>> 15;
+                  x *= 0x2C1B3C6D;
+                  x ^= x >>> 12;
+                  return x;
+              }
+
+              /** Main menu: runs on real time. */
               public static void draw(GuiGraphics g, int w, int h) {
-                  float time = Util.getMillis() / 1000f;
-                  g.fillGradient(0, 0, w, h, 0xFF050B22, 0xFF1E3A6B);
-                  for (int i = 0; i < 60; i++) {
-                      int x = (i * 7919) % Math.max(1, w);
-                      int y = (i * 104729) % Math.max(1, (int) (h * 0.45f));
-                      int a = 120 + (int) (135 * (0.5 + 0.5 * Math.sin(time * 1.5 + i)));
-                      g.fill(x, y, x + 2, y + 2, (a << 24) | 0xFFFFFF);
-                  }
-                  int moon = Math.max(10, h / 14);
-                  int mx = (int) (w * 0.84f);
-                  int my = (int) (h * 0.12f);
-                  g.fill(mx, my, mx + moon, my + moon, 0xFFF4F1DE);
+                  draw(g, w, h, Util.getMillis() / 1000f + 5f);
+              }
+
+              /** time = seconds into the animation. */
+              public static void draw(GuiGraphics g, int w, int h, float time) {
+                  Sprites.ensure();
+                  Sprites.drawSky(g, w, h);
                   for (int lane = 0; lane < 3; lane++) lane(g, w, h, lane, time);
               }
 
@@ -806,9 +815,12 @@ jobs:
                   float local = time + OFFSET[lane];
                   int cycle = (int) Math.floor(local / T);
                   float s = local - cycle * T;
-                  int kind = Math.floorMod(cycle + lane, 4);
-                  int face = ((cycle + lane) % 2 == 0) ? 1 : -1;
-                  int bowDown = (kind == 1 || kind == 3) ? -1 : 1;
+
+                  int hs = hash(cycle, lane);
+                  int kind = Math.floorMod(hs >>> 4, Sprites.KINDS);
+                  int face = (hs & 1) == 0 ? 1 : -1;
+                  int bowDown = (kind == 0 || kind == 6) ? 1 : (((hs >>> 9) & 1) == 0 ? 1 : -1);
+                  float scale = Math.min(1f, 46f / Sprites.LEN[kind]);
 
                   float e = Math.min(1f, s / 6f);
                   e = e * e * (3 - 2 * e);
@@ -816,7 +828,7 @@ jobs:
                   float x = baseX - face * w * 0.8f * (1 - e);
                   float q = Math.max(0f, Math.min(1f, (s - 10f) / 16f));
                   float bob = (float) Math.sin(time * 1.7 + lane) * u * 0.4f;
-                  float tilt = Math.min(1f, q * 1.6f) * (kind == 0 ? 78f : 62f);
+                  float tilt = Math.min(1f, q * 1.6f) * (kind == 0 || kind == 6 ? 78f : 62f);
                   float depth = q * q * u * 70f;
 
                   if (s < 28f) {
@@ -824,23 +836,19 @@ jobs:
                       ps.pushPose();
                       ps.translate(x + face * q * u * 8f, y - u * 2f + bob * (1f - q) + depth, 0f);
                       ps.mulPose(Axis.ZP.rotationDegrees(face * bowDown * tilt));
-                      ps.scale(face, 1f, 1f);
-                      ship(g, kind, u, lane * 7 + cycle);
+                      ps.scale(face * scale, scale, 1f);
+                      Sprites.drawShip(g, kind, u);
                       ps.popPose();
                   }
 
                   // water layer hides whatever has sunk below this lane's surface
                   g.fill(0, y, w, h, WATER[lane]);
-                  long ms = Util.getMillis();
-                  for (int wx = 0; wx < w; wx += u * 2) {
-                      int wy = y + (int) (Math.sin((wx + ms / 7.0 + lane * 90) / (u * 3.0)) * u * 0.5);
-                      g.fill(wx, wy, wx + u * 2, wy + Math.max(1, u / 2), WAVE[lane]);
-                  }
+                  Sprites.drawWaves(g, w, y, u, lane);
 
                   float endX = baseX + face * u * 8f;
                   if (s > 12f && s < 26f) { // bubbles
                       int size = Math.max(2, u / 2);
-                      for (int i = 0; i < 12; i++) {
+                      for (int i = 0; i < 8; i++) {
                           int bx = (int) (endX + ((i * 37) % (u * 20)) - u * 10);
                           int by = y + u * 12 - (int) (((s * 8f + i * 13) % 12f) * u);
                           g.fill(bx, by, bx + size, by + size, 0x90FFFFFF);
@@ -855,89 +863,6 @@ jobs:
                           g.fill(px, y - u / 2, px + u * 2, y, (a << 24) | 0x7A5230);
                       }
                   }
-              }
-
-              private static void ship(GuiGraphics g, int kind, int u, int seed) {
-                  switch (kind) {
-                      case 0 -> liner(g, u, seed);
-                      case 1 -> galleon(g, u, seed);
-                      case 2 -> freighter(g, u, seed);
-                      default -> trawler(g, u, seed);
-                  }
-              }
-
-              private static void liner(GuiGraphics g, int u, int seed) {
-                  block(g, -20 * u, -3 * u, 20 * u, u, 0xFF1A1A1A, u, seed);
-                  block(g, -20 * u, u, 19 * u, 2 * u, 0xFF9E1B1B, u, seed + 1);
-                  g.fill(20 * u, -3 * u, 21 * u, 0, 0xFF1A1A1A);
-                  g.fill(21 * u, -3 * u, 22 * u, -2 * u, 0xFF1A1A1A);
-                  block(g, -16 * u, -6 * u, 14 * u, -3 * u, 0xFFEDEDED, u, seed + 2);
-                  block(g, -12 * u, -8 * u, 8 * u, -6 * u, 0xFFEDEDED, u, seed + 3);
-                  for (int x = -15; x < 13; x += 2) g.fill(x * u, -5 * u, x * u + u, -4 * u, 0xFFFFE08A);
-                  for (int k = 0; k < 4; k++) {
-                      int x = (-9 + k * 5) * u;
-                      block(g, x, -13 * u, x + 3 * u, -8 * u, 0xFFD9A441, u, seed + 4 + k);
-                      g.fill(x, -13 * u, x + 3 * u, -12 * u, 0xFF141414);
-                  }
-                  g.fill(15 * u, -11 * u, 16 * u, -3 * u, 0xFF555555);
-              }
-
-              private static void galleon(GuiGraphics g, int u, int seed) {
-                  block(g, -14 * u, -3 * u, 14 * u, 2 * u, 0xFF6B4423, u, seed);
-                  block(g, -14 * u, -6 * u, -8 * u, -3 * u, 0xFF7A5230, u, seed + 1);
-                  g.fill(14 * u, -3 * u, 18 * u, -2 * u, 0xFF4A2F18);
-                  block(g, -9 * u, -19 * u, 0, -8 * u, 0xFFE8DFC0, u, seed + 2);
-                  block(g, u, -17 * u, 9 * u, -8 * u, 0xFFE8DFC0, u, seed + 3);
-                  g.fill(-4 * u, -21 * u, -3 * u, -3 * u, 0xFF3B2512);
-                  g.fill(5 * u, -19 * u, 6 * u, -3 * u, 0xFF3B2512);
-                  g.fill(-4 * u, -23 * u, -1 * u, -21 * u, 0xFFB22222);
-                  for (int x = -12; x < 12; x += 3) g.fill(x * u, -1 * u, x * u + u, 0, 0xFF1E1208); // gun ports
-              }
-
-              private static void freighter(GuiGraphics g, int u, int seed) {
-                  block(g, -22 * u, -3 * u, 22 * u, 2 * u, 0xFF2C4A3A, u, seed);
-                  block(g, -22 * u, u, 21 * u, 2 * u, 0xFF7B2A2A, u, seed + 1);
-                  g.fill(22 * u, -3 * u, 23 * u, 0, 0xFF2C4A3A);
-                  block(g, -20 * u, -9 * u, -12 * u, -3 * u, 0xFFEFEFEF, u, seed + 2);
-                  g.fill(-19 * u, -7 * u, -13 * u, -6 * u, 0xFF2A3F5F);
-                  g.fill(-17 * u, -12 * u, -14 * u, -9 * u, 0xFFC23B22);
-                  int[] cols = {0xFFC0392B, 0xFF2980B9, 0xFFD68910, 0xFF27AE60};
-                  for (int i = 0; i < 6; i++) {
-                      int x = (-10 + i * 5) * u;
-                      block(g, x, -6 * u, x + 4 * u, -3 * u, cols[i % 4], u, seed + 3 + i);
-                      if (i < 4) block(g, x, -9 * u, x + 4 * u, -6 * u, cols[(i + 2) % 4], u, seed + 9 + i);
-                  }
-              }
-
-              private static void trawler(GuiGraphics g, int u, int seed) {
-                  block(g, -10 * u, -2 * u, 10 * u, 2 * u, 0xFF2F5D8A, u, seed);
-                  g.fill(10 * u, -2 * u, 11 * u, 0, 0xFF2F5D8A);
-                  block(g, -6 * u, -6 * u, 0, -2 * u, 0xFFF2F2F2, u, seed + 1);
-                  g.fill(-5 * u, -5 * u, -1 * u, -4 * u, 0xFF223344);
-                  g.fill(3 * u, -10 * u, 4 * u, -2 * u, 0xFF555555);
-                  g.fill(3 * u, -9 * u, 9 * u, -8 * u, 0xFF555555);
-              }
-
-              /** Fills a rectangle as a grid of slightly varied cells so flat colours look like blocky textures. */
-              private static void block(GuiGraphics g, int x0, int y0, int x1, int y1, int color, int u, int seed) {
-                  for (int y = y0; y < y1; y += u) {
-                      for (int x = x0; x < x1; x += u) {
-                          int hsh = (Math.floorDiv(x, u) * 73856093) ^ (Math.floorDiv(y, u) * 19349663) ^ (seed * 83492791);
-                          int d = (((hsh >>> 8) & 15) - 8) * 2;
-                          g.fill(x, y, Math.min(x + u, x1), Math.min(y + u, y1), shade(color, d));
-                      }
-                  }
-              }
-
-              private static int shade(int c, int d) {
-                  int r = clamp(((c >> 16) & 255) + d);
-                  int gr = clamp(((c >> 8) & 255) + d);
-                  int b = clamp((c & 255) + d);
-                  return 0xFF000000 | (r << 16) | (gr << 8) | b;
-              }
-
-              private static int clamp(int v) {
-                  return Math.max(0, Math.min(255, v));
               }
           }
           EOF
@@ -1212,6 +1137,331 @@ jobs:
           }
           EOF
 
+          cat > src/main/java/com/titania/loader/Sprites.java <<'EOF'
+          package com.titania.loader;
+
+          import com.mojang.blaze3d.platform.NativeImage;
+          import java.util.Random;
+          import net.minecraft.Util;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.renderer.texture.DynamicTexture;
+          import net.minecraft.client.renderer.texture.TextureManager;
+          import net.minecraft.resources.ResourceLocation;
+
+          /**
+           * All ship, sky and wave art is painted ONCE into small textures, then drawn with a single
+           * image draw each. This replaces thousands of per-frame rectangle fills and removes the lag.
+           */
+          public final class Sprites {
+              private Sprites() {}
+
+              public static final int KINDS = 7;
+              /** 0 Titanic-style liner, 1 galleon, 2 freighter, 3 trawler, 4 1800s steamship, 5 modern cruise ship, 6 five-funnel liner */
+              public static final int[] LEN = {44, 36, 46, 22, 38, 60, 64};
+              private static final int[][] DIMS = {{24, 14, 3}, {20, 24, 3}, {25, 13, 3}, {13, 11, 3}, {20, 20, 3}, {31, 22, 3}, {34, 17, 3}};
+              private static final int[] WAVE_COLOR = {0xFF1B4A8A, 0xFF2563A3, 0xFF3A84C4};
+              private static final int SKY_W = 640;
+              private static final int SKY_H = 360;
+
+              private static final DynamicTexture[] SHIPS = new DynamicTexture[KINDS];
+              private static final int[] SW = new int[KINDS];
+              private static final int[] SH = new int[KINDS];
+              private static final int[] SOX = new int[KINDS];
+              private static final int[] SOY = new int[KINDS];
+              private static final ResourceLocation[] SHIP_LOC = new ResourceLocation[KINDS];
+              private static final DynamicTexture[] WAVES = new DynamicTexture[3];
+              private static final ResourceLocation[] WAVE_LOC = new ResourceLocation[3];
+              private static DynamicTexture sky;
+              private static final ResourceLocation SKY_LOC = loc("dyn/sky");
+
+              static {
+                  for (int i = 0; i < KINDS; i++) SHIP_LOC[i] = loc("dyn/ship" + i);
+                  for (int i = 0; i < 3; i++) WAVE_LOC[i] = loc("dyn/wave" + i);
+              }
+
+              private static ResourceLocation loc(String path) {
+                  return ResourceLocation.fromNamespaceAndPath("titanias_loader", path);
+              }
+
+              private static boolean dead(DynamicTexture t) {
+                  return t == null || t.getPixels() == null;
+              }
+
+              /** Builds any missing texture (also rebuilds if a resource reload closed one). Call on the render thread. */
+              public static void ensure() {
+                  TextureManager tm = Minecraft.getInstance().getTextureManager();
+                  for (int k = 0; k < KINDS; k++) {
+                      if (dead(SHIPS[k])) {
+                          Px p = paint(k);
+                          SHIPS[k] = p.texture();
+                          SW[k] = p.w;
+                          SH[k] = p.h;
+                          SOX[k] = p.ox;
+                          SOY[k] = p.oy;
+                          tm.register(SHIP_LOC[k], SHIPS[k]);
+                      }
+                  }
+                  if (dead(sky)) {
+                      sky = makeSky();
+                      tm.register(SKY_LOC, sky);
+                  }
+                  for (int l = 0; l < 3; l++) {
+                      if (dead(WAVES[l])) {
+                          WAVES[l] = makeWave(WAVE_COLOR[l]);
+                          tm.register(WAVE_LOC[l], WAVES[l]);
+                      }
+                  }
+              }
+
+              public static void drawSky(GuiGraphics g, int w, int h) {
+                  g.blit(SKY_LOC, 0, 0, w, h, 0f, 0f, SKY_W, SKY_H, SKY_W, SKY_H);
+              }
+
+              /** Draws a ship with its pivot (centre, waterline) at the current origin; u = screen pixels per sprite pixel. */
+              public static void drawShip(GuiGraphics g, int kind, int u) {
+                  g.blit(SHIP_LOC[kind], -SOX[kind] * u, -SOY[kind] * u, SW[kind] * u, SH[kind] * u,
+                          0f, 0f, SW[kind], SH[kind], SW[kind], SH[kind]);
+              }
+
+              public static void drawWaves(GuiGraphics g, int w, int y, int u, int lane) {
+                  int ws = Math.max(2, u / 2);
+                  int tw = 128 * ws;
+                  int off = (int) ((Util.getMillis() * 0.03f * ws + lane * 400) % tw);
+                  for (int x = -off; x < w; x += tw) {
+                      g.blit(WAVE_LOC[lane], x, y - ws * 2, tw, 4 * ws, 0f, 0f, 128, 4, 128, 4);
+                  }
+              }
+
+              // ---------------------------------------------------------------- painting
+
+              private static final class Px {
+                  final int w, h, ox, oy;
+                  final int[] a;
+
+                  Px(int halfW, int up, int down) {
+                      w = halfW * 2;
+                      h = up + down;
+                      ox = halfW;
+                      oy = up;
+                      a = new int[w * h];
+                  }
+
+                  void rect(int x0, int y0, int x1, int y1, int c) {
+                      for (int y = y0; y < y1; y++) {
+                          for (int x = x0; x < x1; x++) {
+                              int px = x + ox, py = y + oy;
+                              if (px >= 0 && px < w && py >= 0 && py < h) a[py * w + px] = c;
+                          }
+                      }
+                  }
+
+                  /** Like rect, but every pixel is slightly lighter or darker so flat colour reads as a blocky texture. */
+                  void block(int x0, int y0, int x1, int y1, int c, int seed) {
+                      for (int y = y0; y < y1; y++) {
+                          for (int x = x0; x < x1; x++) {
+                              int px = x + ox, py = y + oy;
+                              if (px < 0 || px >= w || py < 0 || py >= h) continue;
+                              int hsh = (x * 73856093) ^ (y * 19349663) ^ (seed * 83492791);
+                              int d = (((hsh >>> 8) & 15) - 8) * 2;
+                              a[py * w + px] = shade(c, d);
+                          }
+                      }
+                  }
+
+                  DynamicTexture texture() {
+                      NativeImage img = new NativeImage(NativeImage.Format.RGBA, w, h, true);
+                      for (int y = 0; y < h; y++) {
+                          for (int x = 0; x < w; x++) img.setPixelRGBA(x, y, abgr(a[y * w + x]));
+                      }
+                      DynamicTexture t = new DynamicTexture(img);
+                      t.setFilter(false, false);
+                      return t;
+                  }
+              }
+
+              private static int abgr(int c) {
+                  return (c & 0xFF00FF00) | ((c >> 16) & 0xFF) | ((c & 0xFF) << 16);
+              }
+
+              private static int shade(int c, int d) {
+                  int r = clamp(((c >> 16) & 255) + d);
+                  int g = clamp(((c >> 8) & 255) + d);
+                  int b = clamp((c & 255) + d);
+                  return 0xFF000000 | (r << 16) | (g << 8) | b;
+              }
+
+              private static int clamp(int v) {
+                  return Math.max(0, Math.min(255, v));
+              }
+
+              private static DynamicTexture makeSky() {
+                  NativeImage img = new NativeImage(NativeImage.Format.RGBA, SKY_W, SKY_H, true);
+                  for (int y = 0; y < SKY_H; y++) {
+                      float t = y / (float) (SKY_H - 1);
+                      int c = 0xFF000000 | ((int) (5 + 25 * t) << 16) | ((int) (11 + 47 * t) << 8) | (int) (34 + 73 * t);
+                      for (int x = 0; x < SKY_W; x++) img.setPixelRGBA(x, y, abgr(c));
+                  }
+                  Random rnd = new Random(7);
+                  for (int i = 0; i < 170; i++) {
+                      int x = rnd.nextInt(SKY_W - 2), y = rnd.nextInt((int) (SKY_H * 0.55f));
+                      int b = 150 + rnd.nextInt(105);
+                      int c = 0xFF000000 | (b << 16) | (b << 8) | b;
+                      int size = i % 6 == 0 ? 2 : 1;
+                      for (int dy = 0; dy < size; dy++) for (int dx = 0; dx < size; dx++) img.setPixelRGBA(x + dx, y + dy, abgr(c));
+                  }
+                  for (int y = 0; y < 22; y++) {
+                      for (int x = 0; x < 22; x++) {
+                          int c = ((x * 7 + y * 13) % 11 == 0) ? 0xFFD9D5BE : 0xFFF4F1DE;
+                          img.setPixelRGBA(540 + x, 36 + y, abgr(c));
+                      }
+                  }
+                  DynamicTexture t = new DynamicTexture(img);
+                  t.setFilter(false, false);
+                  return t;
+              }
+
+              private static DynamicTexture makeWave(int color) {
+                  NativeImage img = new NativeImage(NativeImage.Format.RGBA, 128, 4, true);
+                  for (int x = 0; x < 128; x++) {
+                      int yc = (int) Math.round(1.0 + Math.sin(x * Math.PI * 2 / 64.0));
+                      img.setPixelRGBA(x, yc, abgr(color));
+                      if (yc + 1 < 4) img.setPixelRGBA(x, yc + 1, abgr(shade(color, -25)));
+                  }
+                  DynamicTexture t = new DynamicTexture(img);
+                  t.setFilter(false, false);
+                  return t;
+              }
+
+              private static Px paint(int kind) {
+                  int[] d = DIMS[kind];
+                  Px p = new Px(d[0], d[1], d[2]);
+                  switch (kind) {
+                      case 0 -> liner4(p);
+                      case 1 -> galleon(p);
+                      case 2 -> freighter(p);
+                      case 3 -> trawler(p);
+                      case 4 -> steamship1800s(p);
+                      case 5 -> cruiseShip(p);
+                      default -> liner5(p);
+                  }
+                  return p;
+              }
+
+              private static void liner4(Px p) {
+                  p.block(-20, -3, 20, 1, 0xFF1A1A1A, 1);
+                  p.block(-20, 1, 19, 2, 0xFF9E1B1B, 2);
+                  p.rect(20, -3, 21, 0, 0xFF1A1A1A);
+                  p.rect(21, -3, 22, -2, 0xFF1A1A1A);
+                  p.block(-16, -6, 14, -3, 0xFFEDEDED, 3);
+                  p.block(-12, -8, 8, -6, 0xFFEDEDED, 4);
+                  for (int x = -15; x < 13; x += 2) p.rect(x, -5, x + 1, -4, 0xFFFFE08A);
+                  for (int k = 0; k < 4; k++) {
+                      int x = -9 + k * 5;
+                      p.block(x, -13, x + 3, -8, 0xFFD9A441, 5 + k);
+                      p.rect(x, -13, x + 3, -12, 0xFF141414);
+                  }
+                  p.rect(15, -11, 16, -3, 0xFF555555);
+              }
+
+              private static void galleon(Px p) {
+                  p.block(-14, -3, 14, 2, 0xFF6B4423, 1);
+                  p.block(-14, -6, -8, -3, 0xFF7A5230, 2);
+                  p.rect(14, -3, 18, -2, 0xFF4A2F18);
+                  p.block(-9, -19, 0, -8, 0xFFE8DFC0, 3);
+                  p.block(1, -17, 9, -8, 0xFFE8DFC0, 4);
+                  p.rect(-4, -21, -3, -3, 0xFF3B2512);
+                  p.rect(5, -19, 6, -3, 0xFF3B2512);
+                  p.rect(-4, -23, -1, -21, 0xFFB22222);
+                  for (int x = -12; x < 12; x += 3) p.rect(x, -1, x + 1, 0, 0xFF1E1208);
+              }
+
+              private static void freighter(Px p) {
+                  p.block(-22, -3, 22, 2, 0xFF2C4A3A, 1);
+                  p.block(-22, 1, 21, 2, 0xFF7B2A2A, 2);
+                  p.rect(22, -3, 23, 0, 0xFF2C4A3A);
+                  p.block(-20, -9, -12, -3, 0xFFEFEFEF, 3);
+                  p.rect(-19, -7, -13, -6, 0xFF2A3F5F);
+                  p.rect(-17, -12, -14, -9, 0xFFC23B22);
+                  int[] cols = {0xFFC0392B, 0xFF2980B9, 0xFFD68910, 0xFF27AE60};
+                  for (int i = 0; i < 6; i++) {
+                      int x = -10 + i * 5;
+                      p.block(x, -6, x + 4, -3, cols[i % 4], 3 + i);
+                      if (i < 4) p.block(x, -9, x + 4, -6, cols[(i + 2) % 4], 9 + i);
+                  }
+              }
+
+              private static void trawler(Px p) {
+                  p.block(-10, -2, 10, 2, 0xFF2F5D8A, 1);
+                  p.rect(10, -2, 11, 0, 0xFF2F5D8A);
+                  p.block(-6, -6, 0, -2, 0xFFF2F2F2, 2);
+                  p.rect(-5, -5, -1, -4, 0xFF223344);
+                  p.rect(3, -10, 4, -2, 0xFF555555);
+                  p.rect(3, -9, 9, -8, 0xFF555555);
+              }
+
+              /** 1800s steamship: wooden hull, paddle-wheel box, tall funnel with smoke, and auxiliary sails. */
+              private static void steamship1800s(Px p) {
+                  p.block(-17, -2, 17, 2, 0xFF2B2118, 1);
+                  p.rect(-17, -3, 17, -2, 0xFF7A5230);
+                  p.rect(17, -3, 20, -2, 0xFF7A5230);
+                  p.rect(17, -2, 19, 0, 0xFF2B2118);
+                  p.rect(-17, 0, 17, 1, 0xFFE8E0C8);
+                  p.block(-6, -6, 7, -3, 0xFFD9CDB0, 2);
+                  for (int x = -5; x < 6; x += 3) p.rect(x, -5, x + 2, -4, 0xFF3A4A5A);
+                  p.block(-10, -7, -4, -1, 0xFF8B2E2E, 3);
+                  for (int i = 0; i < 3; i++) p.rect(-9 + i * 2, -6, -8 + i * 2, -2, 0xFF5A1D1D);
+                  p.block(-2, -14, 2, -6, 0xFF1A1A1A, 4);
+                  p.rect(-2, -10, 2, -9, 0xFF9E1B1B);
+                  p.rect(-1, -17, 2, -14, 0xFF777777);
+                  p.rect(1, -19, 4, -16, 0xFF999999);
+                  p.rect(3, -20, 6, -18, 0xFFAAAAAA);
+                  p.rect(-13, -17, -12, -3, 0xFF3B2512);
+                  p.rect(11, -16, 12, -3, 0xFF3B2512);
+                  p.block(-12, -16, -6, -8, 0xFFE8DFC0, 5);
+                  p.block(12, -15, 17, -6, 0xFFE8DFC0, 6);
+              }
+
+              /** Modern cruise ship: stacked white decks with rows of cabin windows, blue hull stripe, one funnel. */
+              private static void cruiseShip(Px p) {
+                  p.block(-28, -3, 29, 1, 0xFFF2F2F2, 1);
+                  p.rect(-28, 1, 28, 2, 0xFF1B3A6B);
+                  p.rect(29, -3, 30, -1, 0xFFF2F2F2);
+                  for (int i = 0; i < 6; i++) {
+                      int y1 = -3 - i * 2;
+                      int x0 = -26 + i * 2;
+                      int x1 = 26 - i * 3;
+                      p.block(x0, y1 - 2, x1, y1, i % 2 == 0 ? 0xFFF8F8F8 : 0xFFE4EAF0, 10 + i);
+                      p.rect(x0, y1 - 2, x1, y1 - 1, 0xFFBFD3E6);
+                      for (int x = x0 + 1; x < x1 - 1; x += 2) p.rect(x, y1 - 1, x + 1, y1, 0xFF2A4A7A);
+                  }
+                  p.block(-8, -20, -3, -15, 0xFFF2F2F2, 30);
+                  p.rect(-8, -20, -3, -19, 0xFF1B3A6B);
+                  p.rect(-8, -17, -3, -16, 0xFF1B3A6B);
+                  p.rect(10, -20, 11, -15, 0xFF888888);
+              }
+
+              /** Ocean liner with five funnels. */
+              private static void liner5(Px p) {
+                  p.block(-30, -3, 30, 1, 0xFF141414, 1);
+                  p.rect(-30, 1, 29, 2, 0xFF9E1B1B);
+                  p.rect(30, -3, 31, 0, 0xFF141414);
+                  p.rect(31, -3, 32, -2, 0xFF141414);
+                  p.rect(-31, -3, -30, 2, 0xFF141414);
+                  p.block(-26, -6, 24, -3, 0xFFEDEDED, 2);
+                  p.block(-20, -9, 16, -6, 0xFFEDEDED, 3);
+                  for (int x = -25; x < 23; x += 2) p.rect(x, -5, x + 1, -4, 0xFFFFE08A);
+                  for (int k = 0; k < 5; k++) {
+                      int x = -17 + k * 7;
+                      p.block(x, -15, x + 4, -9, 0xFFD9A441, 5 + k);
+                      p.rect(x, -15, x + 4, -14, 0xFF141414);
+                  }
+                  p.rect(26, -13, 27, -3, 0xFF555555);
+                  p.rect(-28, -11, -27, -3, 0xFF555555);
+              }
+          }
+          EOF
+
       # ------------------------------------------------------------------
       # 2. Build the loader jar
       # ------------------------------------------------------------------
@@ -1291,6 +1541,7 @@ jobs:
           3. Use the arguments in jvm-args.txt as the profile's JVM arguments (Java 21).
           4. NeoForge mods go in mods/. Fabric, Quilt and Titania mods go in titania_mods/ (created on first launch).
           5. Main menu > Mods shows every mod from every loader, with its load status.
+          6. Loading screens (startup, joining a world, loading terrain) use the sinking-ships animation.
 
           Built in: Sinytra Connector + Forgified Fabric API (Fabric mod support),
           Embeddium, ModernFix, FerriteCore, ImmediatelyFast (stable FPS).
