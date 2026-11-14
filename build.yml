@@ -1,0 +1,492 @@
+name: Build Titania's Mod Loader
+
+# Put this file at .github/workflows/build.yml in an empty repo.
+# It generates the whole project, builds it, downloads the compatibility +
+# performance mods, and uploads a ready-to-use instance zip as an artifact.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ------------------------------------------------------------------
+      # 1. Generate the project (Minecraft 1.21.1 on NeoForge)
+      # ------------------------------------------------------------------
+      - name: Generate project files
+        run: |
+          mkdir -p src/main/java/com/titania/loader
+          mkdir -p src/main/resources/META-INF
+          mkdir -p src/main/resources/assets/titanias_loader
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  gradlePluginPortal()
+                  maven { url = 'https://maven.neoforged.net/releases' }
+              }
+          }
+          rootProject.name = 'titanias_loader'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'java'
+              id 'net.neoforged.moddev' version '2.0.78'
+          }
+          version = '1.0.0'
+          group = 'com.titania'
+          base { archivesName = 'titanias-mod-loader' }
+          java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+          neoForge {
+              version = '21.1.172'
+          }
+          tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+          EOF
+
+          cat > src/main/resources/META-INF/neoforge.mods.toml <<'EOF'
+          modLoader = "javafml"
+          loaderVersion = "[1,)"
+          license = "MIT"
+
+          [[mods]]
+          modId = "titanias_loader"
+          version = "1.0.0"
+          displayName = "Titania's Mod Loader"
+          authors = "Titania"
+          logoFile = "icon.png"
+          description = '''
+          One loader for many mods. Runs NeoForge and Fabric mods together, with a Titanic-themed loading screen and intro, and performance tuning for steady FPS.
+          '''
+
+          [[dependencies.titanias_loader]]
+          modId = "neoforge"
+          type = "required"
+          versionRange = "[21.1,)"
+          ordering = "NONE"
+          side = "CLIENT"
+
+          [[dependencies.titanias_loader]]
+          modId = "minecraft"
+          type = "required"
+          versionRange = "[1.21.1,1.22)"
+          ordering = "NONE"
+          side = "CLIENT"
+          EOF
+
+          # ---- Icon (Titanic) -------------------------------------------
+          pip install pillow
+          python3 - <<'PY'
+          from PIL import Image, ImageDraw
+          S = 128
+          im = Image.new("RGBA", (S, S), (6, 14, 40, 255))
+          d = ImageDraw.Draw(im)
+          d.rectangle([0, 92, S, S], fill=(11, 58, 107, 255))            # sea
+          d.rectangle([14, 72, 112, 88], fill=(20, 20, 20, 255))         # hull
+          d.rectangle([112, 76, 118, 84], fill=(20, 20, 20, 255))        # bow
+          d.rectangle([14, 86, 108, 90], fill=(158, 27, 27, 255))        # red band
+          d.rectangle([24, 58, 100, 72], fill=(237, 237, 237, 255))      # decks
+          d.rectangle([34, 48, 86, 58], fill=(237, 237, 237, 255))
+          for i in range(4):                                             # funnels
+              x = 38 + i * 15
+              d.rectangle([x, 26, x + 9, 48], fill=(217, 164, 65, 255))
+              d.rectangle([x, 26, x + 9, 30], fill=(20, 20, 20, 255))
+          for x in range(28, 98, 6):                                     # windows
+              d.rectangle([x, 63, x + 2, 66], fill=(255, 224, 138, 255))
+          d.rectangle([100, 34, 102, 58], fill=(90, 90, 90, 255))        # mast
+          im.save("src/main/resources/assets/titanias_loader/icon.png")
+          im.save("src/main/resources/icon.png")
+          PY
+
+          # ---- Java: entry point ----------------------------------------
+          cat > src/main/java/com/titania/loader/TitaniasLoader.java <<'EOF'
+          package com.titania.loader;
+
+          import net.neoforged.api.distmarker.Dist;
+          import net.neoforged.fml.common.Mod;
+
+          @Mod(value = "titanias_loader", dist = Dist.CLIENT)
+          public class TitaniasLoader {
+              public TitaniasLoader() {}
+          }
+          EOF
+
+          # ---- Java: events (icon, loading screen swap, intro) ----------
+          cat > src/main/java/com/titania/loader/ClientEvents.java <<'EOF'
+          package com.titania.loader;
+
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.screens.LoadingOverlay;
+          import net.minecraft.client.gui.screens.TitleScreen;
+          import net.neoforged.api.distmarker.Dist;
+          import net.neoforged.bus.api.SubscribeEvent;
+          import net.neoforged.fml.common.EventBusSubscriber;
+          import net.neoforged.neoforge.client.event.ClientTickEvent;
+          import net.neoforged.neoforge.client.event.ScreenEvent;
+
+          @EventBusSubscriber(modid = "titanias_loader", value = Dist.CLIENT)
+          public class ClientEvents {
+              private static boolean iconSet = false;
+              private static boolean introShown = false;
+              private static boolean overlaySwapped = false;
+
+              @SubscribeEvent
+              public static void onTick(ClientTickEvent.Pre event) {
+                  Minecraft mc = Minecraft.getInstance();
+                  if (!iconSet) {
+                      iconSet = true;
+                      WindowIcon.apply(mc);
+                      mc.getWindow().setTitle("Titania's Mod Loader");
+                  }
+                  if (!overlaySwapped && mc.getOverlay() instanceof LoadingOverlay lo) {
+                      overlaySwapped = true;
+                      mc.setOverlay(new TitanicLoadingOverlay(lo));
+                  }
+              }
+
+              @SubscribeEvent
+              public static void onScreen(ScreenEvent.Opening event) {
+                  if (!introShown && event.getNewScreen() instanceof TitleScreen) {
+                      introShown = true;
+                      event.setNewScreen(new TitanicIntroScreen());
+                  }
+              }
+          }
+          EOF
+
+          # ---- Java: window icon ----------------------------------------
+          cat > src/main/java/com/titania/loader/WindowIcon.java <<'EOF'
+          package com.titania.loader;
+
+          import java.io.InputStream;
+          import java.nio.ByteBuffer;
+          import java.nio.IntBuffer;
+          import net.minecraft.client.Minecraft;
+          import org.lwjgl.glfw.GLFW;
+          import org.lwjgl.glfw.GLFWImage;
+          import org.lwjgl.stb.STBImage;
+          import org.lwjgl.system.MemoryStack;
+          import org.lwjgl.system.MemoryUtil;
+
+          public final class WindowIcon {
+              private WindowIcon() {}
+
+              public static void apply(Minecraft mc) {
+                  try (InputStream in = WindowIcon.class.getResourceAsStream("/assets/titanias_loader/icon.png")) {
+                      if (in == null) return;
+                      byte[] bytes = in.readAllBytes();
+                      ByteBuffer file = MemoryUtil.memAlloc(bytes.length);
+                      file.put(bytes);
+                      file.flip();
+                      try (MemoryStack st = MemoryStack.stackPush()) {
+                          IntBuffer w = st.mallocInt(1);
+                          IntBuffer h = st.mallocInt(1);
+                          IntBuffer c = st.mallocInt(1);
+                          ByteBuffer px = STBImage.stbi_load_from_memory(file, w, h, c, 4);
+                          if (px != null) {
+                              GLFWImage.Buffer icons = GLFWImage.malloc(1, st);
+                              icons.position(0).width(w.get(0)).height(h.get(0)).pixels(px);
+                              GLFW.glfwSetWindowIcon(mc.getWindow().getWindow(), icons);
+                              STBImage.stbi_image_free(px);
+                          }
+                      } finally {
+                          MemoryUtil.memFree(file);
+                      }
+                  } catch (Exception ignored) {
+                  }
+              }
+          }
+          EOF
+
+          # ---- Java: the blocky 2D sinking-Titanic scene ----------------
+          cat > src/main/java/com/titania/loader/ShipScene.java <<'EOF'
+          package com.titania.loader;
+
+          import com.mojang.blaze3d.vertex.PoseStack;
+          import com.mojang.math.Axis;
+          import net.minecraft.Util;
+          import net.minecraft.client.gui.Font;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.network.chat.Component;
+
+          public final class ShipScene {
+              private ShipScene() {}
+
+              /** p = sinking progress from 0 (afloat) to 1 (gone). */
+              public static void draw(GuiGraphics g, int w, int h, float p) {
+                  p = Math.max(0f, Math.min(1f, p));
+                  g.fillGradient(0, 0, w, h, 0xFF02040F, 0xFF14284F);
+
+                  for (int i = 0; i < 70; i++) {
+                      int x = (i * 7919) % Math.max(1, w);
+                      int y = (i * 104729) % Math.max(1, (int) (h * 0.55f));
+                      int s = (i % 5 == 0) ? 3 : 2;
+                      g.fill(x, y, x + s, y + s, 0xFFFFFFFF);
+                  }
+                  int moonSize = Math.max(10, h / 14);
+                  int mx = (int) (w * 0.82f);
+                  int my = (int) (h * 0.18f);
+                  g.fill(mx, my, mx + moonSize, my + moonSize, 0xFFF4F1DE);
+
+                  int water = (int) (h * 0.62f);
+                  int u = Math.max(3, h / 48);
+                  float tilt = Math.max(0f, Math.min(1f, (p - 0.12f) / 0.7f));
+                  float sink = p * p * h * 0.6f;
+
+                  PoseStack ps = g.pose();
+                  ps.pushPose();
+                  ps.translate(w / 2f, water - u * 2 + sink, 0f);
+                  ps.mulPose(Axis.ZP.rotationDegrees(tilt * 78f));
+                  ship(g, u);
+                  ps.popPose();
+
+                  // water drawn over the ship so it disappears beneath the surface
+                  g.fill(0, water, w, h, 0xD0083A6E);
+                  long ms = Util.getMillis();
+                  for (int x = 0; x < w; x += u * 2) {
+                      int wy = water + (int) (Math.sin((x + ms / 6.0) / (u * 3.0)) * u * 0.6);
+                      g.fill(x, wy, x + u * 2, wy + u / 2 + 1, 0xFF2E7DB8);
+                  }
+                  if (p > 0.3f) {
+                      int range = Math.max(1, h / 3);
+                      for (int i = 0; i < 14; i++) {
+                          int bx = w / 2 + ((i * 37) % (u * 40)) - u * 20;
+                          int by = water + range - (int) ((ms / 12L + i * 41L) % range);
+                          g.fill(bx, by, bx + 3, by + 3, 0xAAFFFFFF);
+                      }
+                  }
+              }
+
+              private static void ship(GuiGraphics g, int u) {
+                  int BLACK = 0xFF141414, RED = 0xFF9E1B1B, WHITE = 0xFFEDEDED;
+                  int BUFF = 0xFFD9A441, WIN = 0xFFFFE08A, GREY = 0xFF555555;
+                  g.fill(-20 * u, -3 * u, 20 * u, 1 * u, BLACK);      // hull
+                  g.fill(-20 * u, 1 * u, 19 * u, 2 * u, RED);         // red bottom
+                  g.fill(20 * u, -3 * u, 21 * u, 0, BLACK);           // bow steps
+                  g.fill(21 * u, -3 * u, 22 * u, -2 * u, BLACK);
+                  g.fill(-21 * u, -3 * u, -20 * u, 2 * u, BLACK);     // stern
+                  g.fill(-16 * u, -6 * u, 14 * u, -3 * u, WHITE);     // decks
+                  g.fill(-12 * u, -8 * u, 8 * u, -6 * u, WHITE);
+                  for (int x = -15; x < 13; x += 2) {
+                      g.fill(x * u, -5 * u, x * u + u, -4 * u, WIN);  // windows
+                  }
+                  for (int k = 0; k < 4; k++) {                       // four funnels
+                      int x = (-9 + k * 5) * u;
+                      g.fill(x, -13 * u, x + 3 * u, -8 * u, BUFF);
+                      g.fill(x, -13 * u, x + 3 * u, -12 * u, BLACK);
+                  }
+                  g.fill(15 * u, -11 * u, 16 * u, -3 * u, GREY);      // mast
+              }
+
+              public static void title(GuiGraphics g, Font font, int w, int h, String sub) {
+                  PoseStack ps = g.pose();
+                  ps.pushPose();
+                  ps.scale(3f, 3f, 1f);
+                  g.drawCenteredString(font, Component.literal("Titania's Mod Loader"), w / 6, h / 30, 0xFFFFFFFF);
+                  ps.popPose();
+                  if (sub != null) {
+                      g.drawCenteredString(font, Component.literal(sub), w / 2, h - 24, 0xFFB8C7E0);
+                  }
+              }
+          }
+          EOF
+
+          # ---- Java: loading screen (wraps the vanilla one) --------------
+          cat > src/main/java/com/titania/loader/TitanicLoadingOverlay.java <<'EOF'
+          package com.titania.loader;
+
+          import net.minecraft.Util;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.screens.Overlay;
+
+          public class TitanicLoadingOverlay extends Overlay {
+              private final Overlay delegate;
+              private final long start = Util.getMillis();
+
+              public TitanicLoadingOverlay(Overlay delegate) {
+                  this.delegate = delegate;
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
+                  delegate.render(g, mouseX, mouseY, partialTick);
+                  Minecraft mc = Minecraft.getInstance();
+                  if (mc.getOverlay() != this) return; // vanilla overlay finished and removed us
+                  float p = ((Util.getMillis() - start) % 9000L) / 9000f;
+                  int w = g.guiWidth();
+                  int h = g.guiHeight();
+                  ShipScene.draw(g, w, h, p);
+                  ShipScene.title(g, mc.font, w, h, "Loading mods...");
+              }
+
+              @Override
+              public boolean isPauseScreen() {
+                  return delegate.isPauseScreen();
+              }
+          }
+          EOF
+
+          # ---- Java: intro screen before the main menu -------------------
+          cat > src/main/java/com/titania/loader/TitanicIntroScreen.java <<'EOF'
+          package com.titania.loader;
+
+          import net.minecraft.Util;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.gui.screens.TitleScreen;
+          import net.minecraft.network.chat.Component;
+
+          public class TitanicIntroScreen extends Screen {
+              private static final float DURATION = 9f;
+              private long start = -1L;
+              private boolean done = false;
+
+              public TitanicIntroScreen() {
+                  super(Component.literal("Titanic"));
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
+                  if (minecraft.getOverlay() != null) {
+                      start = -1L; // wait until the loading screen is gone
+                      g.fill(0, 0, width, height, 0xFF02040F);
+                      return;
+                  }
+                  if (start < 0) start = Util.getMillis();
+                  float t = (Util.getMillis() - start) / 1000f;
+                  ShipScene.draw(g, width, height, t / DURATION);
+                  ShipScene.title(g, font, width, height, "Click or press any key to skip");
+                  if (t >= DURATION) finish();
+              }
+
+              private void finish() {
+                  if (done) return;
+                  done = true;
+                  minecraft.setScreen(new TitleScreen());
+              }
+
+              @Override
+              public boolean keyPressed(int key, int scan, int mods) {
+                  finish();
+                  return true;
+              }
+
+              @Override
+              public boolean mouseClicked(double x, double y, int button) {
+                  finish();
+                  return true;
+              }
+
+              @Override
+              public boolean shouldCloseOnEsc() {
+                  return false;
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      # 2. Build the loader jar
+      # ------------------------------------------------------------------
+      - name: Build
+        run: gradle build --no-daemon
+
+      # ------------------------------------------------------------------
+      # 3. Fetch compatibility + performance mods from Modrinth
+      # ------------------------------------------------------------------
+      - name: Download bundled mods
+        run: |
+          mkdir -p pack/mods
+          cp build/libs/titanias-mod-loader-*.jar pack/mods/
+          python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request
+
+          MC = "1.21.1"
+          # Fabric-mod support layer + Fabric API port, then FPS/stability mods
+          SLUGS = [
+              "connector",              # Sinytra Connector: runs Fabric mods on NeoForge
+              "forgified-fabric-api",   # Fabric API for Connector
+              "embeddium",              # faster rendering (Sodium port)
+              "modernfix",              # memory + load time + stutter fixes
+              "ferrite-core",           # lower memory use, fewer GC spikes
+              "immediatelyfast",        # faster immediate-mode rendering / GUI
+          ]
+
+          for slug in SLUGS:
+              q = urllib.parse.urlencode({
+                  "loaders": json.dumps(["neoforge"]),
+                  "game_versions": json.dumps([MC]),
+              })
+              req = urllib.request.Request(
+                  f"https://api.modrinth.com/v2/project/{slug}/version?{q}",
+                  headers={"User-Agent": "titanias-mod-loader-build"},
+              )
+              versions = json.load(urllib.request.urlopen(req))
+              if not versions:
+                  print(f"::warning::No NeoForge {MC} build found for {slug}")
+                  continue
+              v = next((x for x in versions if x["version_type"] == "release"), versions[0])
+              f = next((x for x in v["files"] if x.get("primary")), v["files"][0])
+              dest = os.path.join("pack", "mods", f["filename"])
+              urllib.request.urlretrieve(f["url"], dest)
+              print("downloaded", f["filename"])
+          PY
+
+      # ------------------------------------------------------------------
+      # 4. Package a ready-to-use instance
+      # ------------------------------------------------------------------
+      - name: Package instance
+        run: |
+          cat > pack/options.txt <<'EOF'
+          enableVsync:true
+          maxFps:120
+          renderDistance:12
+          simulationDistance:8
+          entityDistanceScaling:1.0
+          biomeBlendRadius:2
+          mipmapLevels:2
+          EOF
+
+          cat > pack/jvm-args.txt <<'EOF'
+          -Xms4G
+          -Xmx4G
+          -XX:+UseZGC
+          -XX:+ZGenerational
+          -XX:+AlwaysPreTouch
+          -XX:+DisableExplicitGC
+          EOF
+
+          cat > pack/README.txt <<'EOF'
+          Titania's Mod Loader (Minecraft 1.21.1, NeoForge)
+
+          1. Install NeoForge 21.1.x for Minecraft 1.21.1 and create a profile with it.
+          2. Copy the "mods" folder (and optionally options.txt) into that profile's game folder.
+          3. Use the arguments in jvm-args.txt as the profile's JVM arguments (Java 21).
+          4. Drop NeoForge mods and Fabric mods for 1.21.1 into the same mods folder.
+
+          Built in: Sinytra Connector + Forgified Fabric API (Fabric mod support),
+          Embeddium, ModernFix, FerriteCore, ImmediatelyFast (stable FPS).
+          EOF
+
+          cd pack
+          zip -r ../Titanias-Mod-Loader-1.21.1.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Titanias-Mod-Loader-1.21.1
+          path: Titanias-Mod-Loader-1.21.1.zip
