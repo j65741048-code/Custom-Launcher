@@ -71,7 +71,7 @@ jobs:
           authors = "Titania"
           logoFile = "icon.png"
           description = '''
-          One loader for many mods. Runs NeoForge and Fabric mods together, with a Titanic-themed loading screen and intro, and performance tuning for steady FPS.
+          A mod loader core that reads Fabric, Quilt, NeoForge, Forge and Titania mods into one list, and loads Fabric, Quilt and Titania mods itself. Titanic loading screen, intro, and a sinking-ships main menu.
           '''
 
           [[dependencies.titanias_loader]]
@@ -118,11 +118,16 @@ jobs:
           package com.titania.loader;
 
           import net.neoforged.api.distmarker.Dist;
+          import net.neoforged.bus.api.IEventBus;
           import net.neoforged.fml.common.Mod;
+          import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
 
           @Mod(value = "titanias_loader", dist = Dist.CLIENT)
           public class TitaniasLoader {
-              public TitaniasLoader() {}
+              public TitaniasLoader(IEventBus modBus) {
+                  TitaniaRuntime.discover();
+                  modBus.addListener(FMLCommonSetupEvent.class, e -> e.enqueueWork(TitaniaRuntime::initialize));
+              }
           }
           EOF
 
@@ -157,13 +162,20 @@ jobs:
                       overlaySwapped = true;
                       mc.setOverlay(new TitanicLoadingOverlay(lo));
                   }
+                  if (mc.getOverlay() == null && mc.screen instanceof TitleScreen) {
+                      mc.setScreen(new TitleScreen());
+                  }
               }
 
               @SubscribeEvent
               public static void onScreen(ScreenEvent.Opening event) {
-                  if (!introShown && event.getNewScreen() instanceof TitleScreen) {
-                      introShown = true;
-                      event.setNewScreen(new TitanicIntroScreen());
+                  if (event.getNewScreen() instanceof TitleScreen) {
+                      if (!introShown) {
+                          introShown = true;
+                          event.setNewScreen(new TitanicIntroScreen());
+                      } else {
+                          event.setNewScreen(new TitaniaTitleScreen());
+                      }
                   }
               }
           }
@@ -378,7 +390,7 @@ jobs:
               private void finish() {
                   if (done) return;
                   done = true;
-                  minecraft.setScreen(new TitleScreen());
+                  minecraft.setScreen(new TitaniaTitleScreen());
               }
 
               @Override
@@ -391,6 +403,806 @@ jobs:
               public boolean mouseClicked(double x, double y, int button) {
                   finish();
                   return true;
+              }
+
+              @Override
+              public boolean shouldCloseOnEsc() {
+                  return false;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/LoadedMod.java <<'EOF'
+          package com.titania.loader;
+
+          public class LoadedMod {
+              public final ModInfo info;
+              public final boolean managed; // true = Titania loads it itself, false = another loader handles it
+              public String status;
+              public boolean failed;
+
+              public LoadedMod(ModInfo info, boolean managed) {
+                  this.info = info;
+                  this.managed = managed;
+                  if (managed) {
+                      this.status = "Discovered";
+                  } else if (info.loader() == ModInfo.Loader.FABRIC || info.loader() == ModInfo.Loader.QUILT) {
+                      this.status = "Handled by the Connector layer";
+                  } else {
+                      this.status = "Loaded by NeoForge";
+                  }
+              }
+
+              public void fail(String why) {
+                  failed = true;
+                  status = "Failed: " + why;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/MetadataReader.java <<'EOF'
+          package com.titania.loader;
+
+          import com.google.gson.JsonElement;
+          import com.google.gson.JsonObject;
+          import com.google.gson.JsonParser;
+          import java.io.InputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipFile;
+
+          /** Reads mod metadata from every supported format: Fabric, Quilt, Titania, NeoForge and Forge. */
+          public final class MetadataReader {
+              private MetadataReader() {}
+
+              private interface Parser {
+                  List<ModInfo> parse() throws Exception;
+              }
+
+              public static List<ModInfo> read(Path jar) {
+                  List<ModInfo> out = new ArrayList<>();
+                  try (ZipFile zf = new ZipFile(jar.toFile())) {
+                      String fab = text(zf, "fabric.mod.json");
+                      if (fab != null) tryAdd(out, jar, () -> List.of(fabric(fab, jar, ModInfo.Loader.FABRIC)));
+                      String qui = text(zf, "quilt.mod.json");
+                      if (qui != null) tryAdd(out, jar, () -> List.of(quilt(qui, jar)));
+                      String tit = text(zf, "titania.mod.json");
+                      if (tit != null) tryAdd(out, jar, () -> List.of(fabric(tit, jar, ModInfo.Loader.TITANIA)));
+                      String neo = text(zf, "META-INF/neoforge.mods.toml");
+                      if (neo != null) tryAdd(out, jar, () -> toml(neo, jar, ModInfo.Loader.NEOFORGE));
+                      String frg = text(zf, "META-INF/mods.toml");
+                      if (frg != null) tryAdd(out, jar, () -> toml(frg, jar, ModInfo.Loader.FORGE));
+                  } catch (Exception e) {
+                      TitaniaRuntime.LOG.warn("Titania: cannot open {}: {}", jar.getFileName(), e.toString());
+                  }
+                  return out;
+              }
+
+              private static void tryAdd(List<ModInfo> out, Path jar, Parser p) {
+                  try {
+                      out.addAll(p.parse());
+                  } catch (Exception e) {
+                      TitaniaRuntime.LOG.warn("Titania: bad metadata in {}: {}", jar.getFileName(), e.toString());
+                  }
+              }
+
+              private static String text(ZipFile zf, String name) {
+                  ZipEntry e = zf.getEntry(name);
+                  if (e == null) return null;
+                  try (InputStream in = zf.getInputStream(e)) {
+                      return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+                  } catch (Exception ex) {
+                      return null;
+                  }
+              }
+
+              private static ModInfo fabric(String json, Path jar, ModInfo.Loader loader) {
+                  JsonObject o = JsonParser.parseString(json).getAsJsonObject();
+                  String id = o.get("id").getAsString();
+                  List<ModInfo.Dep> deps = new ArrayList<>();
+                  if (o.has("depends") && o.get("depends").isJsonObject()) {
+                      for (Map.Entry<String, JsonElement> e : o.getAsJsonObject("depends").entrySet()) {
+                          deps.add(new ModInfo.Dep(e.getKey(), true));
+                      }
+                  }
+                  return new ModInfo(id, str(o, "name", id), str(o, "version", "?"), loader,
+                          str(o, "description", ""), jar, deps, entrypoints(o.get("entrypoints")));
+              }
+
+              private static ModInfo quilt(String json, Path jar) {
+                  JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+                  JsonObject q = root.getAsJsonObject("quilt_loader");
+                  String id = q.get("id").getAsString();
+                  JsonObject meta = q.has("metadata") && q.get("metadata").isJsonObject()
+                          ? q.getAsJsonObject("metadata") : new JsonObject();
+                  List<ModInfo.Dep> deps = new ArrayList<>();
+                  if (q.has("depends") && q.get("depends").isJsonArray()) {
+                      for (JsonElement el : q.getAsJsonArray("depends")) {
+                          if (el.isJsonPrimitive()) {
+                              deps.add(new ModInfo.Dep(el.getAsString(), true));
+                          } else if (el.isJsonObject()) {
+                              JsonObject d = el.getAsJsonObject();
+                              if (!d.has("id")) continue;
+                              boolean optional = d.has("optional") && d.get("optional").getAsBoolean();
+                              deps.add(new ModInfo.Dep(d.get("id").getAsString(), !optional));
+                          }
+                      }
+                  }
+                  return new ModInfo(id, str(meta, "name", id), str(q, "version", "?"), ModInfo.Loader.QUILT,
+                          str(meta, "description", ""), jar, deps, entrypoints(q.get("entrypoints")));
+              }
+
+              private static Map<String, List<String>> entrypoints(JsonElement el) {
+                  Map<String, List<String>> m = new LinkedHashMap<>();
+                  if (el == null || !el.isJsonObject()) return m;
+                  for (Map.Entry<String, JsonElement> e : el.getAsJsonObject().entrySet()) {
+                      List<String> list = new ArrayList<>();
+                      collect(e.getValue(), list);
+                      m.put(e.getKey(), list);
+                  }
+                  return m;
+              }
+
+              private static void collect(JsonElement v, List<String> list) {
+                  if (v.isJsonPrimitive()) {
+                      list.add(v.getAsString());
+                  } else if (v.isJsonArray()) {
+                      for (JsonElement x : v.getAsJsonArray()) collect(x, list);
+                  } else if (v.isJsonObject() && v.getAsJsonObject().has("value")) {
+                      list.add(v.getAsJsonObject().get("value").getAsString());
+                  }
+              }
+
+              private static String str(JsonObject o, String key, String def) {
+                  return o.has(key) && o.get(key).isJsonPrimitive() ? o.get(key).getAsString() : def;
+              }
+
+              /** Small purpose-built TOML reader: [[mods]] and [[dependencies.x]] tables only. */
+              private static List<ModInfo> toml(String text, Path jar, ModInfo.Loader loader) {
+                  List<Map<String, String>> mods = new ArrayList<>();
+                  List<Map<String, String>> deps = new ArrayList<>();
+                  Map<String, String> cur = null;
+                  String[] lines = text.split("\\R");
+                  for (int i = 0; i < lines.length; i++) {
+                      String line = lines[i].trim();
+                      if (line.isEmpty() || line.startsWith("#")) continue;
+                      if (line.startsWith("[[")) {
+                          String table = line.replace("[", "").replace("]", "").trim();
+                          cur = new HashMap<>();
+                          if (table.equals("mods")) {
+                              mods.add(cur);
+                          } else if (table.startsWith("dependencies.")) {
+                              cur.put("owner", table.substring("dependencies.".length()));
+                              deps.add(cur);
+                          } else {
+                              cur = null;
+                          }
+                          continue;
+                      }
+                      if (line.startsWith("[")) {
+                          cur = null;
+                          continue;
+                      }
+                      int eq = line.indexOf('=');
+                      if (eq < 0) continue;
+                      String key = line.substring(0, eq).trim();
+                      String val = line.substring(eq + 1).trim();
+                      String quote = val.startsWith("'''") ? "'''" : val.startsWith("\"\"\"") ? "\"\"\"" : null;
+                      if (quote != null) {
+                          StringBuilder sb = new StringBuilder(val.substring(3));
+                          while (!sb.toString().contains(quote) && i + 1 < lines.length) {
+                              sb.append('\n').append(lines[++i]);
+                          }
+                          int end = sb.indexOf(quote);
+                          val = (end >= 0 ? sb.substring(0, end) : sb.toString()).trim();
+                      } else if ((val.startsWith("\"") || val.startsWith("'")) && val.length() >= 2) {
+                          char q = val.charAt(0);
+                          int end = val.indexOf(q, 1);
+                          val = end > 0 ? val.substring(1, end) : val.substring(1);
+                      } else {
+                          int hash = val.indexOf('#');
+                          if (hash >= 0) val = val.substring(0, hash).trim();
+                      }
+                      if (cur != null) cur.put(key, val);
+                  }
+
+                  List<ModInfo> out = new ArrayList<>();
+                  for (Map<String, String> m : mods) {
+                      String id = m.get("modId");
+                      if (id == null) continue;
+                      List<ModInfo.Dep> d = new ArrayList<>();
+                      for (Map<String, String> dm : deps) {
+                          if (!id.equals(dm.get("owner")) || dm.get("modId") == null) continue;
+                          String type = dm.get("type");
+                          String mandatory = dm.get("mandatory");
+                          boolean required = type != null ? type.equals("required")
+                                  : (mandatory == null || mandatory.equals("true"));
+                          d.add(new ModInfo.Dep(dm.get("modId"), required));
+                      }
+                      out.add(new ModInfo(id, m.getOrDefault("displayName", id), m.getOrDefault("version", "?"),
+                              loader, m.getOrDefault("description", ""), jar, d, new LinkedHashMap<>()));
+                  }
+                  return out;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/ModDiscovery.java <<'EOF'
+          package com.titania.loader;
+
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.List;
+          import java.util.stream.Stream;
+
+          public final class ModDiscovery {
+              private ModDiscovery() {}
+
+              public static List<LoadedMod> scan(Path dir, boolean managed) {
+                  List<LoadedMod> out = new ArrayList<>();
+                  if (!Files.isDirectory(dir)) return out;
+                  try (Stream<Path> files = Files.list(dir)) {
+                      List<Path> jars = files
+                              .filter(p -> p.getFileName().toString().endsWith(".jar"))
+                              .sorted(Comparator.comparing(p -> p.getFileName().toString()))
+                              .toList();
+                      for (Path jar : jars) {
+                          for (ModInfo info : MetadataReader.read(jar)) {
+                              out.add(new LoadedMod(info, managed));
+                          }
+                      }
+                  } catch (IOException e) {
+                      TitaniaRuntime.LOG.warn("Titania: cannot scan {}: {}", dir, e.toString());
+                  }
+                  return out;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/ModInfo.java <<'EOF'
+          package com.titania.loader;
+
+          import java.nio.file.Path;
+          import java.util.List;
+          import java.util.Map;
+
+          public record ModInfo(String id, String name, String version, Loader loader, String description,
+                                Path path, List<Dep> deps, Map<String, List<String>> entrypoints) {
+              public enum Loader { FABRIC, QUILT, NEOFORGE, FORGE, TITANIA }
+
+              public record Dep(String id, boolean required) {}
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/ModResolver.java <<'EOF'
+          package com.titania.loader;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+
+          /** Checks required dependencies and produces a dependency-ordered load list. */
+          public final class ModResolver {
+              private ModResolver() {}
+
+              private static final Set<String> BUILTIN = Set.of(
+                      "minecraft", "java", "fabricloader", "fabric-loader", "quilt_loader", "neoforge", "forge",
+                      "fml", "javafml", "titanias_loader", "fabric", "fabric-api", "quilted_fabric_api", "qsl");
+
+              static String norm(String id) {
+                  int i = id.indexOf(':');
+                  return i >= 0 ? id.substring(i + 1) : id;
+              }
+
+              private static boolean builtin(String id) {
+                  return BUILTIN.contains(id) || id.startsWith("fabric-");
+              }
+
+              public static List<LoadedMod> resolve(List<LoadedMod> all) {
+                  Map<String, LoadedMod> byId = new HashMap<>();
+                  for (LoadedMod m : all) byId.putIfAbsent(m.info.id(), m);
+
+                  boolean changed = true;
+                  while (changed) {
+                      changed = false;
+                      for (LoadedMod m : all) {
+                          if (!m.managed || m.failed) continue;
+                          for (ModInfo.Dep d : m.info.deps()) {
+                              if (!d.required()) continue;
+                              String id = norm(d.id());
+                              if (builtin(id)) continue;
+                              LoadedMod dep = byId.get(id);
+                              if (dep == null || dep.failed) {
+                                  m.fail("missing required dependency '" + id + "'");
+                                  changed = true;
+                                  break;
+                              }
+                          }
+                      }
+                  }
+
+                  List<LoadedMod> order = new ArrayList<>();
+                  Set<LoadedMod> done = new HashSet<>();
+                  Set<LoadedMod> visiting = new HashSet<>();
+                  for (LoadedMod m : all) {
+                      if (m.managed && !m.failed) visit(m, byId, order, done, visiting);
+                  }
+                  return order;
+              }
+
+              private static void visit(LoadedMod m, Map<String, LoadedMod> byId, List<LoadedMod> order,
+                                        Set<LoadedMod> done, Set<LoadedMod> visiting) {
+                  if (done.contains(m)) return;
+                  if (!visiting.add(m)) {
+                      m.fail("dependency cycle");
+                      return;
+                  }
+                  for (ModInfo.Dep d : m.info.deps()) {
+                      LoadedMod dep = byId.get(norm(d.id()));
+                      if (dep != null && dep.managed && !dep.failed) visit(dep, byId, order, done, visiting);
+                  }
+                  visiting.remove(m);
+                  done.add(m);
+                  if (!m.failed) order.add(m);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/SeaBackground.java <<'EOF'
+          package com.titania.loader;
+
+          import com.mojang.blaze3d.vertex.PoseStack;
+          import com.mojang.math.Axis;
+          import net.minecraft.Util;
+          import net.minecraft.client.gui.GuiGraphics;
+
+          /**
+           * Looping 2D side-view animation: three lanes of ships, each cycling through
+           * sailing in, floating, sinking completely, and leaving bubbles and debris.
+           * Everything is drawn with flat, blocky "textured" rectangles.
+           */
+          public final class SeaBackground {
+              private SeaBackground() {}
+
+              private static final float T = 36f; // seconds per ship cycle
+              private static final float[] OFFSET = {0f, 12f, 24f};
+              private static final float[] LANE_Y = {0.50f, 0.61f, 0.74f};
+              private static final float[] LANE_X = {0.27f, 0.70f, 0.46f};
+              private static final float[] LANE_DIV = {70f, 52f, 40f};
+              private static final int[] WATER = {0xF0081F45, 0xF00B2E5E, 0xF00F3F7A};
+              private static final int[] WAVE = {0xFF1B4A8A, 0xFF2563A3, 0xFF3A84C4};
+
+              public static void draw(GuiGraphics g, int w, int h) {
+                  float time = Util.getMillis() / 1000f;
+                  g.fillGradient(0, 0, w, h, 0xFF050B22, 0xFF1E3A6B);
+                  for (int i = 0; i < 60; i++) {
+                      int x = (i * 7919) % Math.max(1, w);
+                      int y = (i * 104729) % Math.max(1, (int) (h * 0.45f));
+                      int a = 120 + (int) (135 * (0.5 + 0.5 * Math.sin(time * 1.5 + i)));
+                      g.fill(x, y, x + 2, y + 2, (a << 24) | 0xFFFFFF);
+                  }
+                  int moon = Math.max(10, h / 14);
+                  int mx = (int) (w * 0.84f);
+                  int my = (int) (h * 0.12f);
+                  g.fill(mx, my, mx + moon, my + moon, 0xFFF4F1DE);
+                  for (int lane = 0; lane < 3; lane++) lane(g, w, h, lane, time);
+              }
+
+              private static void lane(GuiGraphics g, int w, int h, int lane, float time) {
+                  int y = (int) (h * LANE_Y[lane]);
+                  int u = Math.max(2, (int) (h / LANE_DIV[lane]));
+                  float local = time + OFFSET[lane];
+                  int cycle = (int) Math.floor(local / T);
+                  float s = local - cycle * T;
+                  int kind = Math.floorMod(cycle + lane, 4);
+                  int face = ((cycle + lane) % 2 == 0) ? 1 : -1;
+                  int bowDown = (kind == 1 || kind == 3) ? -1 : 1;
+
+                  float e = Math.min(1f, s / 6f);
+                  e = e * e * (3 - 2 * e);
+                  float baseX = w * LANE_X[lane];
+                  float x = baseX - face * w * 0.8f * (1 - e);
+                  float q = Math.max(0f, Math.min(1f, (s - 10f) / 16f));
+                  float bob = (float) Math.sin(time * 1.7 + lane) * u * 0.4f;
+                  float tilt = Math.min(1f, q * 1.6f) * (kind == 0 ? 78f : 62f);
+                  float depth = q * q * u * 70f;
+
+                  if (s < 28f) {
+                      PoseStack ps = g.pose();
+                      ps.pushPose();
+                      ps.translate(x + face * q * u * 8f, y - u * 2f + bob * (1f - q) + depth, 0f);
+                      ps.mulPose(Axis.ZP.rotationDegrees(face * bowDown * tilt));
+                      ps.scale(face, 1f, 1f);
+                      ship(g, kind, u, lane * 7 + cycle);
+                      ps.popPose();
+                  }
+
+                  // water layer hides whatever has sunk below this lane's surface
+                  g.fill(0, y, w, h, WATER[lane]);
+                  long ms = Util.getMillis();
+                  for (int wx = 0; wx < w; wx += u * 2) {
+                      int wy = y + (int) (Math.sin((wx + ms / 7.0 + lane * 90) / (u * 3.0)) * u * 0.5);
+                      g.fill(wx, wy, wx + u * 2, wy + Math.max(1, u / 2), WAVE[lane]);
+                  }
+
+                  float endX = baseX + face * u * 8f;
+                  if (s > 12f && s < 26f) { // bubbles
+                      int size = Math.max(2, u / 2);
+                      for (int i = 0; i < 12; i++) {
+                          int bx = (int) (endX + ((i * 37) % (u * 20)) - u * 10);
+                          int by = y + u * 12 - (int) (((s * 8f + i * 13) % 12f) * u);
+                          g.fill(bx, by, bx + size, by + size, 0x90FFFFFF);
+                      }
+                  }
+                  if (s > 14f && s < 33f) { // floating debris
+                      int a = (int) (255 * Math.min(1f, (33f - s) / 4f));
+                      for (int i = 0; i < 6; i++) {
+                          int dx = (i - 3) * u * 4 + (int) (Math.sin(time * 0.8 + i) * u)
+                                  + (int) ((s - 14f) * u * 0.3f * (i % 2 == 0 ? 1 : -1));
+                          int px = (int) endX + dx;
+                          g.fill(px, y - u / 2, px + u * 2, y, (a << 24) | 0x7A5230);
+                      }
+                  }
+              }
+
+              private static void ship(GuiGraphics g, int kind, int u, int seed) {
+                  switch (kind) {
+                      case 0 -> liner(g, u, seed);
+                      case 1 -> galleon(g, u, seed);
+                      case 2 -> freighter(g, u, seed);
+                      default -> trawler(g, u, seed);
+                  }
+              }
+
+              private static void liner(GuiGraphics g, int u, int seed) {
+                  block(g, -20 * u, -3 * u, 20 * u, u, 0xFF1A1A1A, u, seed);
+                  block(g, -20 * u, u, 19 * u, 2 * u, 0xFF9E1B1B, u, seed + 1);
+                  g.fill(20 * u, -3 * u, 21 * u, 0, 0xFF1A1A1A);
+                  g.fill(21 * u, -3 * u, 22 * u, -2 * u, 0xFF1A1A1A);
+                  block(g, -16 * u, -6 * u, 14 * u, -3 * u, 0xFFEDEDED, u, seed + 2);
+                  block(g, -12 * u, -8 * u, 8 * u, -6 * u, 0xFFEDEDED, u, seed + 3);
+                  for (int x = -15; x < 13; x += 2) g.fill(x * u, -5 * u, x * u + u, -4 * u, 0xFFFFE08A);
+                  for (int k = 0; k < 4; k++) {
+                      int x = (-9 + k * 5) * u;
+                      block(g, x, -13 * u, x + 3 * u, -8 * u, 0xFFD9A441, u, seed + 4 + k);
+                      g.fill(x, -13 * u, x + 3 * u, -12 * u, 0xFF141414);
+                  }
+                  g.fill(15 * u, -11 * u, 16 * u, -3 * u, 0xFF555555);
+              }
+
+              private static void galleon(GuiGraphics g, int u, int seed) {
+                  block(g, -14 * u, -3 * u, 14 * u, 2 * u, 0xFF6B4423, u, seed);
+                  block(g, -14 * u, -6 * u, -8 * u, -3 * u, 0xFF7A5230, u, seed + 1);
+                  g.fill(14 * u, -3 * u, 18 * u, -2 * u, 0xFF4A2F18);
+                  block(g, -9 * u, -19 * u, 0, -8 * u, 0xFFE8DFC0, u, seed + 2);
+                  block(g, u, -17 * u, 9 * u, -8 * u, 0xFFE8DFC0, u, seed + 3);
+                  g.fill(-4 * u, -21 * u, -3 * u, -3 * u, 0xFF3B2512);
+                  g.fill(5 * u, -19 * u, 6 * u, -3 * u, 0xFF3B2512);
+                  g.fill(-4 * u, -23 * u, -1 * u, -21 * u, 0xFFB22222);
+                  for (int x = -12; x < 12; x += 3) g.fill(x * u, -1 * u, x * u + u, 0, 0xFF1E1208); // gun ports
+              }
+
+              private static void freighter(GuiGraphics g, int u, int seed) {
+                  block(g, -22 * u, -3 * u, 22 * u, 2 * u, 0xFF2C4A3A, u, seed);
+                  block(g, -22 * u, u, 21 * u, 2 * u, 0xFF7B2A2A, u, seed + 1);
+                  g.fill(22 * u, -3 * u, 23 * u, 0, 0xFF2C4A3A);
+                  block(g, -20 * u, -9 * u, -12 * u, -3 * u, 0xFFEFEFEF, u, seed + 2);
+                  g.fill(-19 * u, -7 * u, -13 * u, -6 * u, 0xFF2A3F5F);
+                  g.fill(-17 * u, -12 * u, -14 * u, -9 * u, 0xFFC23B22);
+                  int[] cols = {0xFFC0392B, 0xFF2980B9, 0xFFD68910, 0xFF27AE60};
+                  for (int i = 0; i < 6; i++) {
+                      int x = (-10 + i * 5) * u;
+                      block(g, x, -6 * u, x + 4 * u, -3 * u, cols[i % 4], u, seed + 3 + i);
+                      if (i < 4) block(g, x, -9 * u, x + 4 * u, -6 * u, cols[(i + 2) % 4], u, seed + 9 + i);
+                  }
+              }
+
+              private static void trawler(GuiGraphics g, int u, int seed) {
+                  block(g, -10 * u, -2 * u, 10 * u, 2 * u, 0xFF2F5D8A, u, seed);
+                  g.fill(10 * u, -2 * u, 11 * u, 0, 0xFF2F5D8A);
+                  block(g, -6 * u, -6 * u, 0, -2 * u, 0xFFF2F2F2, u, seed + 1);
+                  g.fill(-5 * u, -5 * u, -1 * u, -4 * u, 0xFF223344);
+                  g.fill(3 * u, -10 * u, 4 * u, -2 * u, 0xFF555555);
+                  g.fill(3 * u, -9 * u, 9 * u, -8 * u, 0xFF555555);
+              }
+
+              /** Fills a rectangle as a grid of slightly varied cells so flat colours look like blocky textures. */
+              private static void block(GuiGraphics g, int x0, int y0, int x1, int y1, int color, int u, int seed) {
+                  for (int y = y0; y < y1; y += u) {
+                      for (int x = x0; x < x1; x += u) {
+                          int hsh = (Math.floorDiv(x, u) * 73856093) ^ (Math.floorDiv(y, u) * 19349663) ^ (seed * 83492791);
+                          int d = (((hsh >>> 8) & 15) - 8) * 2;
+                          g.fill(x, y, Math.min(x + u, x1), Math.min(y + u, y1), shade(color, d));
+                      }
+                  }
+              }
+
+              private static int shade(int c, int d) {
+                  int r = clamp(((c >> 16) & 255) + d);
+                  int gr = clamp(((c >> 8) & 255) + d);
+                  int b = clamp((c & 255) + d);
+                  return 0xFF000000 | (r << 16) | (gr << 8) | b;
+              }
+
+              private static int clamp(int v) {
+                  return Math.max(0, Math.min(255, v));
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/TitaniaMod.java <<'EOF'
+          package com.titania.loader;
+
+          /** Native Titania mod entrypoint. Declare it under "entrypoints": {"titania": [...]} in titania.mod.json. */
+          public interface TitaniaMod {
+              void onInitialize();
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/TitaniaModListScreen.java <<'EOF'
+          package com.titania.loader;
+
+          import java.util.List;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /** One list for every mod, whichever loader it was built for. */
+          public class TitaniaModListScreen extends Screen {
+              private final Screen parent;
+              private int scroll = 0;
+
+              public TitaniaModListScreen(Screen parent) {
+                  super(Component.literal("Titania Mods"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  addRenderableWidget(Button.builder(Component.literal("Back"), b -> minecraft.setScreen(parent))
+                          .bounds(width / 2 - 100, height - 28, 200, 20).build());
+              }
+
+              @Override
+              public void renderBackground(GuiGraphics g, int mx, int my, float pt) {
+                  g.fill(0, 0, width, height, 0xFF0A1428);
+              }
+
+              private static int color(ModInfo.Loader l) {
+                  return switch (l) {
+                      case FABRIC -> 0xFFDBB68A;
+                      case QUILT -> 0xFF8E6BBF;
+                      case NEOFORGE -> 0xFFE8803A;
+                      case FORGE -> 0xFF4F7DC4;
+                      case TITANIA -> 0xFF4FC3C3;
+                  };
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mx, int my, float pt) {
+                  super.render(g, mx, my, pt);
+                  List<LoadedMod> mods = TitaniaRuntime.mods();
+                  g.drawCenteredString(font, "Titania Mod List", width / 2, 10, 0xFFFFFFFF);
+
+                  int[] counts = new int[ModInfo.Loader.values().length];
+                  for (LoadedMod m : mods) counts[m.info.loader().ordinal()]++;
+                  StringBuilder sum = new StringBuilder(mods.size() + " mods:");
+                  for (ModInfo.Loader l : ModInfo.Loader.values()) {
+                      if (counts[l.ordinal()] > 0) sum.append("  ").append(l.name()).append(' ').append(counts[l.ordinal()]);
+                  }
+                  g.drawCenteredString(font, sum.toString(), width / 2, 24, 0xFFB8C7E0);
+
+                  if (mods.isEmpty()) {
+                      g.drawCenteredString(font, "No mods found. Put Fabric, Quilt or Titania mods in titania_mods/",
+                              width / 2, height / 2, 0xFFB8C7E0);
+                      return;
+                  }
+                  int rowH = 26;
+                  int top = 44;
+                  int visible = Math.max(1, (height - 80) / rowH);
+                  scroll = Math.max(0, Math.min(Math.max(0, mods.size() - visible), scroll));
+                  for (int i = 0; i < visible && scroll + i < mods.size(); i++) {
+                      LoadedMod m = mods.get(scroll + i);
+                      int y = top + i * rowH;
+                      g.fill(16, y - 2, width - 16, y + rowH - 4, 0x40FFFFFF);
+                      String title = font.plainSubstrByWidth(m.info.name() + "  " + m.info.version(), width - 140);
+                      g.drawString(font, title, 22, y, 0xFFFFFFFF);
+                      g.drawString(font, m.info.loader().name(), width - 100, y, color(m.info.loader()));
+                      String status = font.plainSubstrByWidth(m.status, width - 44);
+                      g.drawString(font, status, 22, y + 11, m.failed ? 0xFFFF6B6B : 0xFF9FB3C8);
+                  }
+              }
+
+              @Override
+              public boolean mouseScrolled(double x, double y, double scrollX, double scrollY) {
+                  scroll -= (int) Math.signum(scrollY);
+                  return true;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/TitaniaRuntime.java <<'EOF'
+          package com.titania.loader;
+
+          import com.mojang.logging.LogUtils;
+          import java.io.IOException;
+          import java.lang.reflect.Method;
+          import java.lang.reflect.Modifier;
+          import java.net.URL;
+          import java.net.URLClassLoader;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.neoforged.fml.loading.FMLPaths;
+          import org.slf4j.Logger;
+
+          /**
+           * The Titania loader core.
+           *  - discovers mods (titania_mods/ = loaded by Titania, mods/ = observed for the unified list)
+           *  - reads Fabric, Quilt, Titania, NeoForge and Forge metadata
+           *  - resolves dependencies and orders the load
+           *  - loads each Titania-managed mod through its own class loader and runs its entrypoints
+           */
+          public final class TitaniaRuntime {
+              private TitaniaRuntime() {}
+
+              public static final Logger LOG = LogUtils.getLogger();
+              private static final List<LoadedMod> MODS = new ArrayList<>();
+              private static URLClassLoader modLoader;
+
+              public static List<LoadedMod> mods() {
+                  return MODS;
+              }
+
+              public static void discover() {
+                  MODS.clear();
+                  Path game = FMLPaths.GAMEDIR.get();
+                  Path managedDir = game.resolve("titania_mods");
+                  try {
+                      Files.createDirectories(managedDir);
+                  } catch (IOException ignored) {
+                  }
+                  MODS.addAll(ModDiscovery.scan(managedDir, true));
+                  MODS.addAll(ModDiscovery.scan(game.resolve("mods"), false));
+                  LOG.info("Titania: discovered {} mods ({} managed by Titania)", MODS.size(),
+                          MODS.stream().filter(m -> m.managed).count());
+              }
+
+              public static void initialize() {
+                  for (LoadedMod m : MODS) {
+                      if (m.managed && (m.info.loader() == ModInfo.Loader.NEOFORGE || m.info.loader() == ModInfo.Loader.FORGE)) {
+                          m.fail("NeoForge/Forge mods belong in the normal mods folder");
+                      }
+                  }
+                  List<LoadedMod> order = ModResolver.resolve(MODS);
+                  URL[] urls = order.stream().map(m -> url(m.info.path())).toArray(URL[]::new);
+                  modLoader = new URLClassLoader("titania-mods", urls, TitaniaRuntime.class.getClassLoader());
+
+                  for (LoadedMod m : order) {
+                      List<String> keys = switch (m.info.loader()) {
+                          case FABRIC -> List.of("main", "client");
+                          case QUILT -> List.of("init", "client_init");
+                          case TITANIA -> List.of("titania");
+                          default -> List.of();
+                      };
+                      int ran = 0;
+                      try {
+                          for (String key : keys) {
+                              for (String spec : m.info.entrypoints().getOrDefault(key, List.of())) {
+                                  run(modLoader, spec, key);
+                                  ran++;
+                              }
+                          }
+                          m.status = ran > 0 ? "Loaded by Titania (" + ran + " entrypoint" + (ran == 1 ? "" : "s") + ")"
+                                  : "Loaded by Titania (no entrypoints)";
+                          LOG.info("Titania: loaded {} {}", m.info.id(), m.info.version());
+                      } catch (Throwable t) {
+                          Throwable root = t.getCause() != null ? t.getCause() : t;
+                          m.fail(root.getClass().getSimpleName() + ": " + root.getMessage());
+                          LOG.error("Titania: failed to load {}", m.info.id(), t);
+                      }
+                  }
+              }
+
+              private static URL url(Path p) {
+                  try {
+                      return p.toUri().toURL();
+                  } catch (Exception e) {
+                      throw new IllegalStateException(e);
+                  }
+              }
+
+              private static void run(ClassLoader cl, String spec, String key) throws Exception {
+                  String clsName = spec;
+                  String member = null;
+                  int i = spec.indexOf("::");
+                  if (i > 0) {
+                      clsName = spec.substring(0, i);
+                      member = spec.substring(i + 2);
+                  }
+                  Class<?> c = Class.forName(clsName, true, cl);
+                  if (member != null) {
+                      Method m = c.getMethod(member);
+                      Object target = Modifier.isStatic(m.getModifiers()) ? null : c.getDeclaredConstructor().newInstance();
+                      m.invoke(target);
+                      return;
+                  }
+                  Object inst = c.getDeclaredConstructor().newInstance();
+                  if (inst instanceof TitaniaMod t) {
+                      t.onInitialize();
+                      return;
+                  }
+                  String name = key.equals("client") || key.equals("client_init") ? "onInitializeClient" : "onInitialize";
+                  for (Method m : c.getMethods()) {
+                      if (m.getName().equals(name)) {
+                          m.invoke(inst, new Object[m.getParameterCount()]);
+                          return;
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/titania/loader/TitaniaTitleScreen.java <<'EOF'
+          package com.titania.loader;
+
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.gui.screens.multiplayer.JoinMultiplayerScreen;
+          import net.minecraft.client.gui.screens.options.OptionsScreen;
+          import net.minecraft.client.gui.screens.worldselection.SelectWorldScreen;
+          import net.minecraft.network.chat.Component;
+
+          /** Main menu with the animated sinking-ships background. */
+          public class TitaniaTitleScreen extends Screen {
+              public TitaniaTitleScreen() {
+                  super(Component.literal("Titania's Mod Loader"));
+              }
+
+              @Override
+              protected void init() {
+                  int bw = 200;
+                  int x = width / 2 - bw / 2;
+                  int y = height / 2 - 20;
+                  int gap = 24;
+                  addRenderableWidget(Button.builder(Component.literal("Singleplayer"),
+                          b -> minecraft.setScreen(new SelectWorldScreen(this))).bounds(x, y, bw, 20).build());
+                  addRenderableWidget(Button.builder(Component.literal("Multiplayer"),
+                          b -> minecraft.setScreen(new JoinMultiplayerScreen(this))).bounds(x, y + gap, bw, 20).build());
+                  addRenderableWidget(Button.builder(Component.literal("Mods (" + TitaniaRuntime.mods().size() + ")"),
+                          b -> minecraft.setScreen(new TitaniaModListScreen(this))).bounds(x, y + gap * 2, bw, 20).build());
+                  addRenderableWidget(Button.builder(Component.literal("Options"),
+                          b -> minecraft.setScreen(new OptionsScreen(this, minecraft.options))).bounds(x, y + gap * 3, bw, 20).build());
+                  addRenderableWidget(Button.builder(Component.literal("Quit Game"),
+                          b -> minecraft.stop()).bounds(x, y + gap * 4, bw, 20).build());
+              }
+
+              @Override
+              public void renderBackground(GuiGraphics g, int mx, int my, float pt) {
+                  // the sea scene is drawn in render(); skip the vanilla panorama and blur
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mx, int my, float pt) {
+                  SeaBackground.draw(g, width, height);
+                  g.fill(width / 2 - 112, height / 2 - 32, width / 2 + 112, height / 2 + 108, 0x66000000);
+                  ShipScene.title(g, font, width, height, "Minecraft 1.21.1  |  " + TitaniaRuntime.mods().size() + " mods");
+                  super.render(g, mx, my, pt);
               }
 
               @Override
@@ -477,7 +1289,8 @@ jobs:
           1. Install NeoForge 21.1.x for Minecraft 1.21.1 and create a profile with it.
           2. Copy the "mods" folder (and optionally options.txt) into that profile's game folder.
           3. Use the arguments in jvm-args.txt as the profile's JVM arguments (Java 21).
-          4. Drop NeoForge mods and Fabric mods for 1.21.1 into the same mods folder.
+          4. NeoForge mods go in mods/. Fabric, Quilt and Titania mods go in titania_mods/ (created on first launch).
+          5. Main menu > Mods shows every mod from every loader, with its load status.
 
           Built in: Sinytra Connector + Forgified Fabric API (Fabric mod support),
           Embeddium, ModernFix, FerriteCore, ImmediatelyFast (stable FPS).
